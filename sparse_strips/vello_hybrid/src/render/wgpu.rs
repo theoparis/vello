@@ -422,9 +422,10 @@ impl Renderer {
         self.programs.prepare(
             device,
             queue,
+            encoder,
             &mut self.gradient_cache,
             &self.encoded_paints,
-            &mut scene.strip_storage.borrow_mut().alphas,
+            &scene.strip_storage.borrow().alphas,
             render_size,
             &self.paint_idxs,
             &self.filter_context,
@@ -452,6 +453,7 @@ impl Renderer {
             &self.filter_context,
             encoded_paints,
         )?;
+        self.programs.staging_belt.finish();
         self.gradient_cache.maintain();
 
         Ok(())
@@ -865,6 +867,8 @@ struct Programs {
     encoded_paints_data: Vec<u8>,
     /// Scratch buffer for staging filter data texture data.
     filter_data: Vec<u8>,
+    /// Staging belt for recycling temporary upload buffers across frames.
+    staging_belt: wgpu::util::StagingBelt,
 }
 
 #[derive(Debug)]
@@ -1025,6 +1029,57 @@ impl GpuStrip {
     }
 }
 
+/// Upload `data` into a 2D `texture` through the staging belt.
+fn upload_texture_via_belt(
+    staging_belt: &mut wgpu::util::StagingBelt,
+    encoder: &mut CommandEncoder,
+    texture: &Texture,
+    data: &[u8],
+    bytes_per_texel: u32,
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let texture_width = texture.width();
+    let bytes_per_row = texture_width * bytes_per_texel;
+    let rows_needed = (data.len() as u32).div_ceil(bytes_per_row);
+    let buffer_size = u64::from(rows_needed) * u64::from(bytes_per_row);
+
+    let size = wgpu::BufferSize::new(buffer_size)
+        // Data is never empty.
+        .unwrap();
+
+    let alignment = wgpu::BufferSize::new(bytes_per_texel.into()).unwrap();
+    let slice = staging_belt.allocate(size, alignment);
+    // Copy data into staging buffer.
+    let mut view = slice.get_mapped_range_mut();
+    view.slice(..data.len()).copy_from_slice(data);
+
+    // Now upload the data from staging buffer to the texture.
+    encoder.copy_buffer_to_texture(
+        wgpu::TexelCopyBufferInfo {
+            buffer: slice.buffer(),
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: slice.offset(),
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: None,
+            },
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        Extent3d {
+            width: texture_width,
+            height: rows_needed,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 impl Programs {
     fn new(
         device: &Device,
@@ -1145,10 +1200,10 @@ impl Programs {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Strip Pipeline Layout"),
                 bind_group_layouts: &[
-                    &strip_bind_group_layout,
-                    &atlas_bind_group_layout,
-                    &encoded_paints_bind_group_layout,
-                    &gradient_bind_group_layout,
+                    Some(&strip_bind_group_layout),
+                    Some(&atlas_bind_group_layout),
+                    Some(&encoded_paints_bind_group_layout),
+                    Some(&gradient_bind_group_layout),
                 ],
                 immediate_size: 0,
             });
@@ -1156,7 +1211,7 @@ impl Programs {
         let clear_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Clear Slots Pipeline Layout"),
-                bind_group_layouts: &[&clear_bind_group_layout],
+                bind_group_layouts: &[Some(&clear_bind_group_layout)],
                 immediate_size: 0,
             });
 
@@ -1324,9 +1379,9 @@ impl Programs {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Filter Pipeline Layout"),
                 bind_group_layouts: &[
-                    &filter_bind_group_layout,
-                    &filter_input_bind_group_layouts[0],
-                    &filter_input_bind_group_layouts[1],
+                    Some(&filter_bind_group_layout),
+                    Some(&filter_input_bind_group_layouts[0]),
+                    Some(&filter_input_bind_group_layouts[1]),
                 ],
                 immediate_size: 0,
             });
@@ -1572,6 +1627,18 @@ impl Programs {
             },
             clear_pipeline,
             atlas_clear_pipeline,
+            // From the documentation, regarding choosing an optimal chunk size:
+            // * larger than the largest single [`StagingBelt::write_buffer()`] operation;
+            // * 1-4 times less than the total amount of data uploaded per submission
+            //   (per [`StagingBelt::finish()`]); and
+            // * bigger is better, within these bounds.
+            // It's a bit hard to come up with a good number here since the size of alphas and strips
+            // can vary arbitrarily from scene to scene, but since we do allocate a
+            // couple of different buffers (filter data, gradient data, etc.),
+            // we don't want to make this too large.
+            //
+            // 4MB sounds like a good size.
+            staging_belt: wgpu::util::StagingBelt::new(device.clone(), 4 * 1024 * 1024),
         }
     }
 
@@ -1865,26 +1932,30 @@ impl Programs {
         &mut self,
         device: &Device,
         queue: &Queue,
+        encoder: &mut CommandEncoder,
         gradient_cache: &mut GradientRampCache,
         encoded_paints: &[GpuEncodedPaint],
-        alphas: &mut Vec<u8>,
+        alphas: &[u8],
         new_render_size: &RenderSize,
         paint_idxs: &[u32],
         filter_context: &FilterContext,
     ) {
+        // Recall the allocations from the last frame.
+        self.staging_belt.recall();
+
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
         self.maybe_resize_alphas_tex(device, max_texture_dimension_2d, alphas.len());
         self.maybe_resize_encoded_paints_tex(device, max_texture_dimension_2d, paint_idxs);
         self.maybe_resize_filter_tex(device, max_texture_dimension_2d, filter_context);
         self.maybe_update_config_buffer(queue, max_texture_dimension_2d, new_render_size);
 
-        self.upload_alpha_texture(queue, alphas);
-        self.upload_encoded_paints_texture(queue, encoded_paints);
-        self.upload_filter_texture(queue, filter_context);
+        self.upload_alpha_texture(encoder, alphas);
+        self.upload_encoded_paints_texture(encoder, encoded_paints);
+        self.upload_filter_texture(encoder, filter_context);
 
         if gradient_cache.has_changed() {
             self.maybe_resize_gradient_tex(device, max_texture_dimension_2d, gradient_cache);
-            self.upload_gradient_texture(queue, gradient_cache);
+            self.upload_gradient_texture(encoder, gradient_cache);
             gradient_cache.mark_synced();
         }
     }
@@ -2154,7 +2225,7 @@ impl Programs {
     }
 
     /// Upload alpha data to the texture.
-    fn upload_alpha_texture(&mut self, queue: &Queue, alphas: &mut Vec<u8>) {
+    fn upload_alpha_texture(&mut self, encoder: &mut CommandEncoder, alphas: &[u8]) {
         if alphas.is_empty() {
             return;
         }
@@ -2165,65 +2236,39 @@ impl Programs {
 
         let original_len = alphas.len();
 
-        // Temporarily pad the length of the alphas to the texture size before uploading.
-        alphas.resize(total_size, 0);
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.resources.alphas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_texture_via_belt(
+            &mut self.staging_belt,
+            encoder,
+            &self.resources.alphas_texture,
             alphas,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), which is equivalent to
-                // a bit shift of 4.
-                bytes_per_row: Some(texture_width << 4),
-                rows_per_image: Some(texture_height),
-            },
-            Extent3d {
-                width: texture_width,
-                height: texture_height,
-                depth_or_array_layers: 1,
-            },
+            16,
         );
-
-        // Truncate back to the original size.
-        alphas.truncate(original_len);
     }
 
-    /// Upload encoded paints to the texture.
-    fn upload_encoded_paints_texture(&mut self, queue: &Queue, encoded_paints: &[GpuEncodedPaint]) {
+    fn upload_encoded_paints_texture(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        encoded_paints: &[GpuEncodedPaint],
+    ) {
         let encoded_paints_texture = &self.resources.encoded_paints_texture;
         let encoded_paints_texture_width = encoded_paints_texture.width();
         let encoded_paints_texture_height = encoded_paints_texture.height();
 
         GpuEncodedPaint::serialize_to_buffer(encoded_paints, &mut self.encoded_paints_data);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: encoded_paints_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_texture_via_belt(
+            &mut self.staging_belt,
+            encoder,
+            encoded_paints_texture,
             &self.encoded_paints_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                // 16 bytes per RGBA32Uint texel (4 u32s × 4 bytes each), equivalent to bit shift of 4
-                bytes_per_row: Some(encoded_paints_texture_width << 4),
-                rows_per_image: Some(encoded_paints_texture_height),
-            },
-            Extent3d {
-                width: encoded_paints_texture_width,
-                height: encoded_paints_texture_height,
-                depth_or_array_layers: 1,
-            },
+            16,
         );
     }
 
-    fn upload_filter_texture(&mut self, queue: &Queue, filter_context: &FilterContext) {
+    fn upload_filter_texture(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        filter_context: &FilterContext,
+    ) {
         if filter_context.is_empty() {
             return;
         }
@@ -2233,29 +2278,21 @@ impl Programs {
         let height = filter_texture.height();
 
         filter_context.serialize_to_buffer(&mut self.filter_data);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: filter_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_texture_via_belt(
+            &mut self.staging_belt,
+            encoder,
+            filter_texture,
             &self.filter_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width << 4),
-                rows_per_image: Some(height),
-            },
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+            16,
         );
     }
 
     /// Upload gradient data to the texture.
-    fn upload_gradient_texture(&mut self, queue: &Queue, gradient_cache: &mut GradientRampCache) {
+    fn upload_gradient_texture(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        gradient_cache: &mut GradientRampCache,
+    ) {
         let gradient_texture = &self.resources.gradient_texture;
         let gradient_texture_width = gradient_texture.width();
         let gradient_texture_height = gradient_texture.height();
@@ -2269,26 +2306,7 @@ impl Programs {
             let old_luts_len = luts.len();
             luts.resize(total_capacity, 0);
 
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: gradient_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &luts,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    // 4 bytes per RGBA8 pixel
-                    bytes_per_row: Some(gradient_texture_width << 2),
-                    rows_per_image: Some(gradient_texture_height),
-                },
-                Extent3d {
-                    width: gradient_texture_width,
-                    height: gradient_texture_height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            upload_texture_via_belt(&mut self.staging_belt, encoder, gradient_texture, &luts, 16);
 
             // Restore the luts back to the cache
             luts.truncate(old_luts_len);
@@ -2296,19 +2314,73 @@ impl Programs {
         }
     }
 
-    /// Upload the strip data by creating and assigning a new `self.resources.strips_buffer`.
-    fn upload_strips(&mut self, device: &Device, queue: &Queue, strips: &[GpuStrip]) {
-        let required_strips_size = size_of_val(strips) as u64;
-        self.resources.strips_buffer = Self::create_strips_buffer(device, required_strips_size);
-        // TODO: Consider using a staging belt to avoid an extra staging buffer allocation.
-        let mut buffer = queue
-            .write_buffer_with(
-                &self.resources.strips_buffer,
+    /// Upload the strip data.
+    fn upload_strips(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        strips: &[GpuStrip],
+    ) {
+        if strips.is_empty() {
+            return;
+        }
+
+        let required_size = size_of_val(strips) as u64;
+        let size = wgpu::BufferSize::new(required_size).unwrap();
+
+        if required_size > self.resources.strips_buffer.size() {
+            self.resources.strips_buffer = Self::create_strips_buffer(device, required_size);
+        }
+        let mut view =
+            self.staging_belt
+                .write_buffer(encoder, &self.resources.strips_buffer, 0, size);
+        view.copy_from_slice(bytemuck::cast_slice(strips));
+    }
+
+    /// Upload filter instance data.
+    fn upload_filter_instances(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        instances: &[FilterInstanceData],
+    ) {
+        let required_size = size_of_val(instances) as u64;
+        if let Some(size) = wgpu::BufferSize::new(required_size) {
+            if required_size > self.resources.filter_instance_buffer.size() {
+                self.resources.filter_instance_buffer =
+                    Self::create_filter_instance_buffer(device, required_size);
+            }
+            let mut view = self.staging_belt.write_buffer(
+                encoder,
+                &self.resources.filter_instance_buffer,
                 0,
-                required_strips_size.try_into().unwrap(),
-            )
-            .expect("Capacity handled in creation");
-        buffer.copy_from_slice(bytemuck::cast_slice(strips));
+                size,
+            );
+            view.copy_from_slice(bytemuck::cast_slice(instances));
+        }
+    }
+
+    /// Upload clear-slot indices.
+    fn upload_clear_slot_indices(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        slot_indices: &[u32],
+    ) {
+        let required_size = size_of_val(slot_indices) as u64;
+        if let Some(size) = wgpu::BufferSize::new(required_size) {
+            if required_size > self.resources.clear_slot_indices_buffer.size() {
+                self.resources.clear_slot_indices_buffer =
+                    Self::create_clear_slot_indices_buffer(device, required_size);
+            }
+            let mut view = self.staging_belt.write_buffer(
+                encoder,
+                &self.resources.clear_slot_indices_buffer,
+                0,
+                size,
+            );
+            view.copy_from_slice(bytemuck::cast_slice(slot_indices));
+        }
     }
 }
 
@@ -2338,7 +2410,8 @@ impl RendererContext<'_> {
         }
         // TODO: We currently allocate a new strips buffer for each render pass. A more efficient
         // approach would be to re-use buffers or slices of a larger buffer.
-        self.programs.upload_strips(self.device, self.queue, strips);
+        self.programs
+            .upload_strips(self.device, self.encoder, strips);
 
         enum MaybeOwned<'a, T> {
             Borrowed(&'a T),
@@ -2505,28 +2578,14 @@ impl RendererContext<'_> {
             return;
         }
 
-        let resources = &mut self.programs.resources;
-        let size = size_of_val(slot_indices) as u64;
-        // TODO: We currently allocate a new strips buffer for each render pass. A more efficient
-        // approach would be to re-use buffers or slices of a larger buffer.
-        resources.clear_slot_indices_buffer =
-            Programs::create_clear_slot_indices_buffer(self.device, size);
-        // TODO: Consider using a staging belt to avoid an extra staging buffer allocation.
-        let mut buffer = self
-            .queue
-            .write_buffer_with(
-                &resources.clear_slot_indices_buffer,
-                0,
-                size.try_into().unwrap(),
-            )
-            .expect("Capacity handled in creation");
-        buffer.copy_from_slice(bytemuck::cast_slice(slot_indices));
+        self.programs
+            .upload_clear_slot_indices(self.device, self.encoder, slot_indices);
 
         {
             let mut render_pass = self.encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Clear Slots Render Pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &resources.slot_texture_views[ix],
+                    view: &self.programs.resources.slot_texture_views[ix],
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -2542,8 +2601,11 @@ impl RendererContext<'_> {
             });
 
             render_pass.set_pipeline(&self.programs.clear_pipeline);
-            render_pass.set_bind_group(0, &resources.clear_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, resources.clear_slot_indices_buffer.slice(..));
+            render_pass.set_bind_group(0, &self.programs.resources.clear_bind_group, &[]);
+            render_pass.set_vertex_buffer(
+                0,
+                self.programs.resources.clear_slot_indices_buffer.slice(..),
+            );
             render_pass.draw(0..4, 0..u32::try_from(slot_indices.len()).unwrap());
         }
     }
@@ -2592,15 +2654,8 @@ impl RendererBackend for RendererContext<'_> {
 
         let instances = self.filter_pass_state.instances();
         let instance_stride = size_of::<FilterInstanceData>() as u64;
-        let total_size = instances.len() as u64 * instance_stride;
-        // TODO: Reuse buffer (https://github.com/linebender/vello/pull/1494#discussion_r2937890819)
-        self.programs.resources.filter_instance_buffer =
-            Programs::create_filter_instance_buffer(self.device, total_size);
-        self.queue.write_buffer(
-            &self.programs.resources.filter_instance_buffer,
-            0,
-            bytemuck::cast_slice(instances),
-        );
+        self.programs
+            .upload_filter_instances(self.device, self.encoder, instances);
 
         let programs = &self.programs;
         let encoder = &mut self.encoder;
